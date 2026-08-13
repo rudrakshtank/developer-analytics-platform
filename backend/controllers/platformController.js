@@ -146,32 +146,29 @@ const verifyPlatform = async (req, res) => {
             return res.status(400).json({ success: false, message: `The ${platform} account '${account.username}' is already verified and linked to another user!` });
         }
 
-        const username = account.username;
+        const username = account.username; // <-- Declared here
         let isVerified = false;
 
         try {
             let profileDataString = '';
 
             if (platformKey === 'geeksforgeeks') {
-                const gfgUrl = `https://www.geeksforgeeks.org/user/${username}/`;
-                
-                const response = await axios.get(gfgUrl, { 
+                const response = await axios.get(`https://www.geeksforgeeks.org/user/${username}/`, { 
                     timeout: 15000,
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    }
+                    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
                 });
-                
                 profileDataString = response.data;
-
-            } else {
-                let apiUrl = '';
-                if (platformKey === 'github') {
-                    apiUrl = `https://api.github.com/users/${username}`;
-                } else {
-                    apiUrl = `https://${platformKey}-stats.tashif.codes/${username}/profile`;
-                }
-
+            } 
+            else if (platformKey === 'github') {
+                // 🚀 FIXED: Using ${username} instead of ${platformUser}
+                const response = await axios.get(`https://api.github.com/users/${username}`, { 
+                    timeout: 10000,
+                    headers: { 'User-Agent': 'Codolio-App' } 
+                });
+                profileDataString = JSON.stringify(response.data);
+            } 
+            else {
+                const apiUrl = `https://${platformKey}-stats.tashif.codes/${username}/profile`;
                 const response = await axios.get(apiUrl, { timeout: 10000 });
                 profileDataString = JSON.stringify(response.data);
             }
@@ -182,11 +179,15 @@ const verifyPlatform = async (req, res) => {
             
         } catch (apiError) {
             console.error(`Verification API Error for ${platformKey}:`, apiError.message);
+            if (apiError.response && apiError.response.status === 403) {
+                return res.status(400).json({ success: false, message: `GitHub API limit reached or blocked. Try again in a few minutes.` });
+            }
             return res.status(400).json({ 
                 success: false, 
                 message: `Verification failed: Could not fetch profile data for ${platform}. Ensure the username is correct and public.` 
             });
         }
+
         if (isVerified) {
             user.connectedAccounts[platformKey].verified = true;
             user.markModified('connectedAccounts');
@@ -200,7 +201,7 @@ const verifyPlatform = async (req, res) => {
         } else {
             return res.status(400).json({ 
                 success: false, 
-                message: `Verification failed. Could not find your code ${verificationCode} on your ${platform} profile. Please paste it and try again.` 
+                message: `Verification failed. Could not find your code ${verificationCode} on your ${platform} profile. Please paste it into your Bio and try again.` 
             });
         }
     } catch (error) {
@@ -430,8 +431,14 @@ const syncCodeforces = async (req, res) => {
         const username = user.connectedAccounts.codeforces.username;
         const BASE = `https://codeforces-stats.tashif.codes/${username}`;
 
-        const [profileRes, statsRes, heatmapRes, contestsRes, topicsRes, ratingRes, langRes] = await Promise.allSettled([
-            axios.get(`${BASE}/profile`), axios.get(`${BASE}/stats`), axios.get(`${BASE}/heatmap`), axios.get(`${BASE}/contests`), axios.get(`${BASE}/topics`), axios.get(`${BASE}/rating`), axios.get(`${BASE}/languages`)
+        // Fetching all endpoints concurrently [cite: 5376]
+        const [profileRes, statsRes, heatmapRes, contestsRes, topicsRes, ratingRes] = await Promise.allSettled([
+            axios.get(`${BASE}/profile`), 
+            axios.get(`${BASE}/stats`), 
+            axios.get(`${BASE}/heatmap`), 
+            axios.get(`${BASE}/contests`), 
+            axios.get(`${BASE}/topics`), 
+            axios.get(`${BASE}/rating`)
         ]);
 
         const profileData = profileRes.status === 'fulfilled' && profileRes.value.data.data ? profileRes.value.data.data : {};
@@ -440,34 +447,66 @@ const syncCodeforces = async (req, res) => {
         const contestsData = contestsRes.status === 'fulfilled' && contestsRes.value.data.data ? contestsRes.value.data.data : {};
         const topicsData = topicsRes.status === 'fulfilled' && topicsRes.value.data.data ? topicsRes.value.data.data : [];
         const ratingData = ratingRes.status === 'fulfilled' && ratingRes.value.data.data ? ratingRes.value.data.data : {};
-        const langData = langRes.status === 'fulfilled' && langRes.value.data.data ? langRes.value.data.data : (statsData.languages || profileData.languages || []);
 
-        const totalSolved = statsData.totalSolved || profileData.totalSolved || 0;
+        let totalSolved = statsData.totalSolved || profileData.totalSolved || 0;
+
+        if (totalSolved === 0) {
+            try {
+                const officialRes = await axios.get(`https://codeforces.com/api/user.status?handle=${username}`);
+                const submissions = officialRes.data.result || [];
+                const uniqueSolved = new Set();
+                
+                submissions.forEach(sub => {
+                    if (sub.verdict === 'OK' && sub.problem && sub.problem.name) {
+                        uniqueSolved.add(sub.problem.name);
+                    }
+                });
+                totalSolved = uniqueSolved.size;
+            } catch (cfError) {
+                console.error('Official CF API Error:', cfError.message);
+            }
+        }
+
         const { daily, monthly, totalSubs } = processHeatmap(heatmapData);
         let acceptanceRate = heatmapData.totalSubmissions ? (totalSolved / heatmapData.totalSubmissions) * 100 : 100;
 
         const contestHistoryRaw = contestsData.history || contestsData.contestHistory || ratingData.history || (Array.isArray(contestsData) ? contestsData : []);
         const contestHistory = contestHistoryRaw.map(c => ({
-            contestName: c.contestName || c.name || "Codeforces Contest", rating: Math.round(c.newRating || c.rating || 0), rank: c.rank || c.ranking || 0
-        })).reverse();
+            contestName: c.contestName || c.name || "Codeforces Contest",
+            rating: Math.round(c.newRating || c.rating || 0),
+            rank: c.rank || c.ranking || 0
+        })).reverse(); 
 
         let tagsMap = {};
-        if (Array.isArray(topicsData)) topicsData.forEach(t => tagsMap[t.topic] = t.count);
-        else if (statsData.topicAnalysis) statsData.topicAnalysis.forEach(t => tagsMap[t.topic] = t.count);
+        if (Array.isArray(topicsData)) {
+            topicsData.forEach(t => tagsMap[t.topic] = t.count);
+        } else if (statsData.topicAnalysis) {
+            statsData.topicAnalysis.forEach(t => tagsMap[t.topic] = t.count);
+        }
 
-        const currentRating = ratingData.current || ratingData.rating || contestsData.current || profileData.rating || profileData.currentRating || 0;
-        const maxRating = ratingData.max || ratingData.maxRating || contestsData.max || profileData.maxRating || currentRating;
+        const currentRating = ratingData.current || ratingData.rating || contestsData.current || profileData.rating || profileData.currentRating || 0; 
+        const maxRating = ratingData.max || ratingData.maxRating || contestsData.max || profileData.maxRating || currentRating; 
 
         user.connectedAccounts.codeforces.stats = {
-            totalSolved: totalSolved, totalSubmissions: totalSubs, acceptanceRate: acceptanceRate.toFixed(2), currentRating: currentRating, maxRating: maxRating,
-            rank: getCFRank(currentRating), maxRank: getCFRank(maxRating), submissionCalendar: JSON.stringify(daily), monthlySubmissions: JSON.stringify(monthly),
-            contestHistory: contestHistory, problemTags: tagsMap, languageStats: parseLanguages(langData)
+            totalSolved: totalSolved,
+            totalSubmissions: totalSubs,
+            acceptanceRate: acceptanceRate.toFixed(2),
+            currentRating: currentRating,
+            maxRating: maxRating,
+            rank: getCFRank(currentRating), 
+            maxRank: getCFRank(maxRating), 
+            submissionCalendar: JSON.stringify(daily), 
+            monthlySubmissions: JSON.stringify(monthly), 
+            contestHistory: contestHistory, 
+            problemTags: tagsMap 
         };
 
-        user.lumaScore = (user.lumaScore || 0) + totalSolved;
-        await user.save();
-        res.status(200).json({ success: true, message: 'Codeforces Synced!', stats: user.connectedAccounts.codeforces.stats });
-    } catch (err) { res.status(500).json({ success: false, message: 'Codeforces Error: ' + err.message }); }
+        user.lumaScore = (user.lumaScore || 0) + totalSolved; 
+        await user.save(); 
+        res.status(200).json({ success: true, message: 'Codeforces Synced Successfully!', stats: user.connectedAccounts.codeforces.stats }); 
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Codeforces Error: ' + err.message });
+    }
 };
 
 const syncCodeChef = async (req, res) => {
@@ -559,15 +598,15 @@ const unlinkPlatform = async (req, res) => {
 
         const platformKey = platform.toLowerCase();
         
+        // 🚀 FULLY WIPE THE PLATFORM DATA
         user.connectedAccounts[platformKey] = {
             username: "",
             verified: false,
-            stats: {}
+            stats: {} // Deletes all scraped data
         };
-        
         user.markModified('connectedAccounts');
         
-        // Recalculate lumaScore
+        // 🚀 RECALCULATE SCORE (It will immediately drop the points)
         const { calculateLumaScore } = require('../utils/scoreCalculator');
         const sc = calculateLumaScore(user.connectedAccounts);
         user.lumaScore = sc.totalScore;
@@ -580,6 +619,5 @@ const unlinkPlatform = async (req, res) => {
         res.status(500).json({ success: false, message: 'Server Error during unlink' });
     }
 };
-
 
 module.exports = { connectPlatform, generateVerificationCode, verifyPlatform, syncGeeksForGeeks, syncCodeChef, syncLeetCode, syncCodeforces, syncGitHub, cLuma, syncAllData, unlinkPlatform };
