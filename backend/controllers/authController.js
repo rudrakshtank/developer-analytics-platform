@@ -42,8 +42,8 @@ const registerUser = async (req, res) => {
 
             await sendEmail({
                 email: user.email,
-                subject: 'Welcome to DevVerse - Verify Your Email',
-                message: `Hi ${user.name},\n\nWelcome to DevVerse! Your email verification OTP is: ${otp}\n\nIt is valid for 10 minutes. Please enter this code to complete your registration.`
+                subject: 'Welcome to Codolio - Verify Your Email',
+                message: `Hi ${user.name},\n\nWelcome to Codolio! Your email verification OTP is: ${otp}\n\nIt is valid for 10 minutes. Please enter this code to complete your registration.`
             });
 
             res.status(201).json({
@@ -185,12 +185,12 @@ const requestOTP = async (req, res) => {
         if (type === 'reset') {
             user.resetPasswordOTP = otp;
             user.resetPasswordOTPExpires = otpExpires;
-            subject = 'DevVerse - Password Reset OTP';
+            subject = 'Codolio - Password Reset OTP';
             message = `Your password reset OTP is: ${otp}. It is valid for 10 minutes.`;
         } else if (type === 'verify') {
             user.emailVerificationOTP = otp;
             user.emailVerificationOTPExpires = otpExpires;
-            subject = 'DevVerse - Verify Your Email';
+            subject = 'Codolio - Verify Your Email';
             message = `Your email verification OTP is: ${otp}. It is valid for 10 minutes.`;
         } else {
             return res.status(400).json({ success: false, message: 'Invalid OTP type requested' });
@@ -241,7 +241,7 @@ const verifyOTP = async (req, res) => {
 
             return res.status(200).json({ 
                 success: true, 
-                message: 'Email verified successfully! Welcome to DevVerse.',
+                message: 'Email verified successfully! Welcome to Codolio.',
                 token: token,
                 user: {
                     id: user._id,
