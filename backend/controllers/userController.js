@@ -3,7 +3,7 @@ const { calculateLumaScore } = require('../utils/scoreCalculator');
 
 const getPublicProfile = async (req, res) => {
     try {
-        const user = await User.findOne({ username: req.params.username });
+        const user = await User.findOne({ username: new RegExp(`^${req.params.username.trim()}$`, 'i') });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
         
         const scoreData = calculateLumaScore(user.connectedAccounts);
@@ -12,7 +12,20 @@ const getPublicProfile = async (req, res) => {
             await user.save();
         }
 
-        res.status(200).json({ success: true, user, scoreBreakdown: scoreData.breakdown });
+        const totalUsers = await User.countDocuments({ lumaScore: { $gt: 0 } });
+        const higherScoring = await User.countDocuments({ lumaScore: { $gt: user.lumaScore } });
+        const globalRank = user.lumaScore > 0 ? higherScoring + 1 : totalUsers || 1;
+        const percentile = (user.lumaScore > 0 && totalUsers > 0) 
+            ? Math.max(1, Math.round((globalRank / totalUsers) * 100)) 
+            : 100;
+
+        res.status(200).json({ 
+            success: true, 
+            user, 
+            scoreBreakdown: scoreData.breakdown, 
+            globalRank,
+            percentile 
+        });
     } catch (error) { 
         res.status(500).json({ success: false, message: error.message }); 
     }
@@ -23,7 +36,7 @@ const getLeaderboard = async (req, res) => {
         const params = { ...req.query, ...req.body };
         const { status, search, page = 1, limit = 50, minScore, maxScore, graduationYear } = params;
 
-        let query = { visibility: 'Public' };
+        let query = {}; 
 
         if (status && status.trim() !== "") {
             query.professionalStatus = { $regex: status.trim(), $options: 'i' };
@@ -31,77 +44,60 @@ const getLeaderboard = async (req, res) => {
 
         if (search && search.trim() !== "") {
             query.$or = [
-                { username: { $regex: search.trim(), $options: 'i' } },
-                { name: { $regex: search.trim(), $options: 'i' } }
+                { name: { $regex: search.trim(), $options: 'i' } },
+                { username: { $regex: search.trim(), $options: 'i' } }
             ];
         }
 
-        if (minScore || maxScore) {
+        if (minScore !== undefined || maxScore !== undefined) {
             query.lumaScore = {};
-            if (minScore) query.lumaScore.$gte = parseInt(minScore);
-            if (maxScore) query.lumaScore.$lte = parseInt(maxScore);
+            if (minScore !== undefined) query.lumaScore.$gte = Number(minScore);
+            if (maxScore !== undefined) query.lumaScore.$lte = Number(maxScore);
         }
 
-        if (graduationYear && graduationYear.trim() !== "") {
-            query.graduationYear = parseInt(graduationYear);
+        if (graduationYear) {
+            query.graduationYear = Number(graduationYear);
         }
 
-        const skip = (parseInt(page) - 1) * parseInt(limit);
-        const totalUsers = await User.countDocuments(query);
+        const skip = (Number(page) - 1) * Number(limit);
 
         const users = await User.find(query)
-            .select('name username profilePicture professionalStatus graduationYear lumaScore connectedAccounts')
             .sort({ lumaScore: -1 })
             .skip(skip)
-            .limit(parseInt(limit));
+            .limit(Number(limit))
+            .select('-password -emailVerificationOTP -resetPasswordOTP -emailVerificationOTPExpires');
 
-        const getPlatformId = (acc) => {
-            return (acc && acc.verified && acc.username && acc.username.trim() !== "") 
-                ? acc.username 
-                : "Not registered";
-        };
+        const maskedLeaderboard = users.map(user => {
+            if (user.visibility === 'Private') {
+                const userObj = user.toObject ? user.toObject() : user;
+                return {
+                    ...userObj,
+                    name: 'Anonymous User',
+                    username: 'anonymous', 
+                    profilePicture: 'https://ui-avatars.com/api/?name=Anonymous&background=0D1117&color=fff',
+                    isPrivate: true 
+                };
+            }
+            return user;
+        });
 
-        const leaderboard = users.map((u, idx) => ({
-            rank: skip + idx + 1,
-            name: u.name,
-            username: u.username,
-            profilePicture: u.profilePicture,
-            professionalStatus: u.professionalStatus || "Student",
-            graduationYear: u.graduationYear || "Not specified", // Exposed to frontend
-            lumaScore: u.lumaScore || 0,
-            activePlatforms: {
-                leetcode: getPlatformId(u.connectedAccounts?.leetcode),
-                codeforces: getPlatformId(u.connectedAccounts?.codeforces),
-                codechef: getPlatformId(u.connectedAccounts?.codechef),
-                geeksforgeeks: getPlatformId(u.connectedAccounts?.geeksforgeeks),
-                github: getPlatformId(u.connectedAccounts?.github)
-            },
-            badgesCount: (
-                (u.connectedAccounts?.leetcode?.stats?.totalBadges || 0) +
-                (u.connectedAccounts?.github?.stats?.totalBadges || 0) +
-                (u.connectedAccounts?.codechef?.stats?.badgesData?.length || 0)
-            )
-        }));
+        const totalUsers = await User.countDocuments(query);
 
         res.status(200).json({
             success: true,
-            pagination: {
-                totalUsers,
-                currentPage: parseInt(page),
-                totalPages: Math.ceil(totalUsers / parseInt(limit)),
-                limit: parseInt(limit)
-            },
-            leaderboard
+            leaderboard: maskedLeaderboard,
+            currentPage: Number(page),
+            totalPages: Math.ceil(totalUsers / limit),
+            totalUsers
         });
-
-    } catch (error) { 
-        res.status(500).json({ success: false, message: 'Leaderboard Error: ' + error.message }); 
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 
 const completeOnboarding = async (req, res) => {
     try {
-        const { professionalStatus, college, graduationYear, skipped } = req.body;
+        const { professionalStatus, college, position, graduationYear, experienceYears, location, bio, skipped } = req.body;
 
         const user = await User.findById(req.user._id);
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
@@ -109,24 +105,17 @@ const completeOnboarding = async (req, res) => {
         if (!skipped) {
             if (professionalStatus) user.professionalStatus = professionalStatus.trim();
             if (college) user.college = college.trim();
+            if (position) user.position = position.trim();
             if (graduationYear) user.graduationYear = parseInt(graduationYear);
+            if (experienceYears) user.experienceYears = parseInt(experienceYears);
+            if (location) user.location = location.trim();
+            if (bio) user.bio = bio.trim();
         }
 
         user.isOnboardingComplete = true;
         await user.save();
 
-        res.status(200).json({
-            success: true,
-            message: skipped ? 'Onboarding skipped.' : 'Profile onboarding completed successfully!',
-            user: {
-                name: user.name,
-                username: user.username,
-                professionalStatus: user.professionalStatus,
-                college: user.college,
-                graduationYear: user.graduationYear,
-                isOnboardingComplete: user.isOnboardingComplete
-            }
-        });
+        res.status(200).json({ success: true, message: skipped ? 'Onboarding skipped.' : 'Profile onboarding completed successfully!', user });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Onboarding Error: ' + error.message });
     }
@@ -173,6 +162,13 @@ const getGlobalAnalytics = async (req, res) => {
             user.lumaScore = scoreData.totalScore;
             await user.save();
         }
+
+        const totalUsers = await User.countDocuments({ lumaScore: { $gt: 0 } });
+        const higherScoring = await User.countDocuments({ lumaScore: { $gt: scoreData.totalScore } });
+        const globalRank = scoreData.totalScore > 0 ? higherScoring + 1 : totalUsers || 1;
+        const percentile = (scoreData.totalScore > 0 && totalUsers > 0) 
+            ? Math.max(1, Math.round((globalRank / totalUsers) * 100)) 
+            : 100;
 
         const platformsToAggregate = ['leetcode', 'codeforces', 'codechef', 'geeksforgeeks', 'github'];
         const codingPlatforms = ['leetcode', 'codeforces', 'codechef', 'geeksforgeeks'];
@@ -306,6 +302,8 @@ const getGlobalAnalytics = async (req, res) => {
             data: {
                 lumaScore: scoreData.totalScore,
                 scoreBreakdown: scoreData.breakdown,
+                globalRank,
+                percentile,
                 globalHeatmap, 
                 globalMonthly,
                 activity: { totalActiveDays, currentStreak, maxStreak, platformsActiveToday },
@@ -313,10 +311,8 @@ const getGlobalAnalytics = async (req, res) => {
                     totalDsaProblems: totalDsaSolved,
                     topics: dsaAnalysisArray 
                 },
-                githubContributions: githubContributions, 
-                
-                platformActivity: platformActivity,
-                
+                githubContributions, 
+                platformActivity,
                 topLanguages: languagePieChart
             }
         });
@@ -330,11 +326,10 @@ const updateUserProfile = async (req, res) => {
         const user = await User.findById(req.user._id);
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
-        const { name, username, bio, professionalStatus, graduationYear } = req.body;
+        const { name, username, bio, professionalStatus, graduationYear, experienceYears, location, visibility, college } = req.body;
 
         if (username && username.trim() !== user.username) {
             const formattedUsername = username.toLowerCase().trim();
-            // Ensure no one else has this username
             const usernameTaken = await User.findOne({ username: formattedUsername });
             if (usernameTaken) {
                 return res.status(400).json({ success: false, message: 'This username is already taken!' });
@@ -345,9 +340,17 @@ const updateUserProfile = async (req, res) => {
         if (name) user.name = name;
         if (bio !== undefined) user.bio = bio; 
         if (professionalStatus) user.professionalStatus = professionalStatus;
-        if (graduationYear) user.graduationYear = graduationYear;
+        if (graduationYear !== undefined) user.graduationYear = graduationYear;
+        if (experienceYears !== undefined) user.experienceYears = experienceYears;
+        if (location !== undefined) user.location = location;
+        if (visibility) user.visibility = visibility;
+        if (college !== undefined) user.college = college;
 
         await user.save();
+
+        user.password = undefined;
+        user.emailVerificationOTP = undefined;
+        user.resetPasswordOTP = undefined;
 
         res.status(200).json({ success: true, message: 'Profile updated successfully', user });
     } catch (error) {
@@ -443,37 +446,50 @@ const compareProfiles = async (req, res) => {
     try {
         const { username1, username2 } = req.params;
 
-        const user1 = await User.findOne({ username: username1 });
-        const user2 = await User.findOne({ username: username2 });
+        const user1 = await User.findOne({ username: new RegExp(`^${username1.trim()}$`, 'i') });
+        const user2 = await User.findOne({ username: new RegExp(`^${username2.trim()}$`, 'i') });
 
         if (!user1 || !user2) {
-            return res.status(404).json({ success: false, message: 'One or both users could not be found' });
+            const missing = !user1 && !user2 ? `${username1} & ${username2}` : (!user1 ? username1 : username2);
+            return res.status(404).json({ success: false, message: `Developer '${missing}' not found.` });
         }
 
-        const extractStats = (user) => ({
-            name: user.name,
-            username: user.username,
-            profilePicture: user.profilePicture,
-            lumaScore: user.lumaScore,
-            badges: (
-                (user.connectedAccounts?.leetcode?.stats?.totalBadges || 0) +
-                (user.connectedAccounts?.github?.stats?.totalBadges || 0)
-            ),
-            dsaSolved: (
-                (Number(user.connectedAccounts?.leetcode?.stats?.totalSolved) || 0) +
-                (Number(user.connectedAccounts?.geeksforgeeks?.stats?.totalSolved) || 0)
-            ),
-            cpRating: {
-                codeforces: user.connectedAccounts?.codeforces?.stats?.currentRating || 0,
-                codechef: user.connectedAccounts?.codechef?.stats?.currentRating || 0,
-                leetcode: user.connectedAccounts?.leetcode?.stats?.contestRating || 0
-            },
-            githubStars: user.connectedAccounts?.github?.stats?.totalStars || 0
-        });
+        const extractStats = (user) => {
+            const lc = user.connectedAccounts?.leetcode?.stats || {};
+            const cf = user.connectedAccounts?.codeforces?.stats || {};
+            const cc = user.connectedAccounts?.codechef?.stats || {};
+            const gfg = user.connectedAccounts?.geeksforgeeks?.stats || {};
+            const gh = user.connectedAccounts?.github?.stats || {};
+
+            const totalSolved = (Number(lc.totalSolved) || 0) +
+                                (Number(cf.totalSolved) || 0) +
+                                (Number(cc.totalSolved) || 0) +
+                                (Number(gfg.totalSolved) || 0);
+
+            const totalBadges = (Number(lc.totalBadges) || 0) + (Number(gh.totalBadges) || 0);
+
+            const verifiedPlatforms = Object.values(user.connectedAccounts || {})
+                .filter(acc => acc && acc.verified).length;
+
+            return {
+                name: user.name,
+                username: user.username,
+                profilePicture: user.profilePicture || `https://ui-avatars.com/api/?name=${user.name}&background=4F46E5&color=fff`,
+                lumaScore: user.lumaScore || 0,
+                totalSolved,
+                leetcodeRating: Math.round(lc.contestRating || 0),
+                codeforcesRating: Number(cf.currentRating) || 0,
+                codechefRating: Number(cc.currentRating) || 0,
+                githubCommits: Number(gh.totalSubmissions) || Number(gh.totalSolved) || 0,
+                githubStars: Number(gh.totalStars) || 0,
+                totalBadges,
+                verifiedPlatforms
+            };
+        };
 
         res.status(200).json({
             success: true,
-            comparison: {
+            data: {
                 user1: extractStats(user1),
                 user2: extractStats(user2)
             }
@@ -491,7 +507,7 @@ const getSdeSheets = async (req, res) => {
                 title: "Striver's A2Z DSA Sheet",
                 description: "Complete roadmap to learn DSA from scratch to advanced concepts.",
                 url: "https://takeuforward.org/dsa/strivers-a2z-sheet-learn-dsa-a-to-z",
-                icon: "StriverIcon" // Frontend can map this to an image/icon component
+                icon: "StriverIcon"
             },
             {
                 id: "love-babbar",
@@ -553,6 +569,5 @@ const getSdeSheets = async (req, res) => {
 module.exports = { 
     getPublicProfile, getLeaderboard, getGlobalAnalytics, completeOnboarding, 
     updateUserProfile, toggleUserInPlaylist, getUserPlaylists,
-    compareProfiles, connectPlatform,
-    getSdeSheets 
+    compareProfiles, connectPlatform, getSdeSheets 
 };
