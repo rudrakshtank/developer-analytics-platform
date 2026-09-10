@@ -82,7 +82,7 @@ const userSchema = new mongoose.Schema({
     connectedAccounts: {
         leetcode: {
             username: { type: String, default: '' },
-            verified: { type: Boolean, default: true },
+            verified: { type: Boolean, default: false },
             stats: { type: mongoose.Schema.Types.Mixed, default: {} }
         },
         codeforces: {
